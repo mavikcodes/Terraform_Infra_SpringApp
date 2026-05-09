@@ -6,6 +6,7 @@
 
 ## 📋 Table of Contents
 
+- [Deployment Workflow](#-deployment-workflow)
 - [Architecture Overview](#-architecture-overview)
 - [Infrastructure Components](#-infrastructure-components)
 - [Project Structure](#-project-structure)
@@ -17,11 +18,37 @@
   - [Security & IAM](#5-security--iam)
 - [Networking Deep Dive](#-networking-deep-dive)
 - [Module Dependency Graph](#-module-dependency-graph)
-- [Deployment Workflow](#-deployment-workflow)
 - [Variable Hierarchy](#-variable-hierarchy)
 - [How to Deploy](#-how-to-deploy)
 - [Environment Strategy](#-environment-strategy)
 - [Interviewer Highlights](#-interviewer-highlights)
+
+---
+
+## 🚀 Deployment Workflow
+
+```mermaid
+flowchart TD
+    A["👨‍💻 Developer pushes code"] --> B["GitHub Actions triggers"]
+    B --> C["terraform fmt -check\nterraform validate"]
+    C --> D{Lint OK?}
+    D -- No --> E["❌ Fail PR — fix formatting"]
+    D -- Yes --> F["terraform plan\n-var-file=environments/dev.tfvars"]
+    F --> G["Plan output posted\nto PR as comment"]
+    G --> H{PR Approved?}
+    H -- No --> I["🔄 Review & iterate"]
+    H -- Yes --> J["Merge to main"]
+    J --> K["terraform apply\n-var-file=environments/dev.tfvars\n-auto-approve"]
+    K --> L{Apply success?}
+    L -- No --> M["📢 Slack alert\nState unlocked"]
+    L -- Yes --> N["✅ Dev deployed"]
+    N --> O["Manual gate:\nPromote to staging?"]
+    O -- Yes --> P["terraform apply\n-var-file=environments/staging.tfvars"]
+    P --> Q["Integration tests"]
+    Q --> R["Manual gate:\nPromote to prod?"]
+    R -- Yes --> S["terraform apply\n-var-file=environments/prod.tfvars"]
+    S --> T["✅ Production deployed"]
+```
 
 ---
 
@@ -574,33 +601,6 @@ graph TD
     COMPUTE -->|"asg_arn"| MON
     DB -->|"db_instance_id"| MON
     ALB -->|"alb_arn"| MON
-```
-
----
-
-## 🚀 Deployment Workflow
-
-```mermaid
-flowchart TD
-    A["👨‍💻 Developer pushes code"] --> B["GitHub Actions triggers"]
-    B --> C["terraform fmt -check\nterraform validate"]
-    C --> D{Lint OK?}
-    D -- No --> E["❌ Fail PR — fix formatting"]
-    D -- Yes --> F["terraform plan\n-var-file=environments/dev.tfvars"]
-    F --> G["Plan output posted\nto PR as comment"]
-    G --> H{PR Approved?}
-    H -- No --> I["🔄 Review & iterate"]
-    H -- Yes --> J["Merge to main"]
-    J --> K["terraform apply\n-var-file=environments/dev.tfvars\n-auto-approve"]
-    K --> L{Apply success?}
-    L -- No --> M["📢 Slack alert\nState unlocked"]
-    L -- Yes --> N["✅ Dev deployed"]
-    N --> O["Manual gate:\nPromote to staging?"]
-    O -- Yes --> P["terraform apply\n-var-file=environments/staging.tfvars"]
-    P --> Q["Integration tests"]
-    Q --> R["Manual gate:\nPromote to prod?"]
-    R -- Yes --> S["terraform apply\n-var-file=environments/prod.tfvars"]
-    S --> T["✅ Production deployed"]
 ```
 
 ---
