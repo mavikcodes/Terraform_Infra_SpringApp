@@ -25,7 +25,7 @@
 - [Interviewer Highlights](#-interviewer-highlights)
 
 ---
-## ⚙️ How to Deploy
+## How to Deploy
 
 ### Prerequisites
 
