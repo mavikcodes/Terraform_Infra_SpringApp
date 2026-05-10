@@ -1,6 +1,6 @@
 # 🏗️ Terraform Infrastructure — Spring Boot Application on AWS
 
-> **Production-grade Infrastructure as Code** for deploying a highly available, scalable Spring Boot application on AWS. Built with advanced Terraform patterns — custom modules, dynamic parameterization, multi-tier networking, and remote state management.
+> **Infrastructure as Code (IaC)** solution to provision and deploy a Spring Boot (PetClinic) application on AWS using Terraform — fully automated, parameterized, and production-ready.
 
 ---
 
@@ -12,15 +12,16 @@
 - [Project Structure](#-project-structure)
 - [Key Engineering Techniques](#-key-engineering-techniques)
   - [Modular Design](#1-modular-design)
-  - [Dynamic Parameterization](#2-dynamic-parameterization)
-  - [Advanced Networking](#3-advanced-networking)
-  - [Remote State Management](#4-remote-state-management)
-  - [Security & IAM](#5-security--iam)
-- [Networking Deep Dive](#-networking-deep-dive)
+  - [locals + for_each for Dynamic Resource Creation](#2-locals--for_each-for-dynamic-resource-creation)
+  - [Data Sources for Dynamic Parameterization](#3-data-sources-for-dynamic-parameterization)
+  - [templatefile() for Dynamic User Data](#4-templatefile-for-dynamic-user-data)
+  - [Advanced Networking — Three-Tier VPC](#5-advanced-networking--three-tier-vpc)
+  - [Per-AZ NAT Gateway Design](#6-per-az-nat-gateway-design)
+  - [IAM + SSM — No SSH Required](#7-iam--ssm--no-ssh-required)
+  - [Cross-Module Output Passing](#8-cross-module-output-passing)
+  - [lifecycle — create_before_destroy](#9-lifecycle--create_before_destroy)
 - [Module Dependency Graph](#-module-dependency-graph)
-- [Variable Hierarchy](#-variable-hierarchy)
 - [How to Deploy](#-how-to-deploy)
-- [Environment Strategy](#-environment-strategy)
 - [Interviewer Highlights](#-interviewer-highlights)
 
 ---
@@ -29,121 +30,91 @@
 
 ```mermaid
 flowchart TD
-    A["👨‍💻 Developer pushes code"] --> B["GitHub Actions triggers"]
-    B --> C["terraform fmt -check\nterraform validate"]
-    C --> D{Lint OK?}
-    D -- No --> E["❌ Fail PR — fix formatting"]
-    D -- Yes --> F["terraform plan\n-var-file=environments/dev.tfvars"]
-    F --> G["Plan output posted\nto PR as comment"]
-    G --> H{PR Approved?}
-    H -- No --> I["🔄 Review & iterate"]
-    H -- Yes --> J["Merge to main"]
-    J --> K["terraform apply\n-var-file=environments/dev.tfvars\n-auto-approve"]
-    K --> L{Apply success?}
-    L -- No --> M["📢 Slack alert\nState unlocked"]
-    L -- Yes --> N["✅ Dev deployed"]
-    N --> O["Manual gate:\nPromote to staging?"]
-    O -- Yes --> P["terraform apply\n-var-file=environments/staging.tfvars"]
-    P --> Q["Integration tests"]
-    Q --> R["Manual gate:\nPromote to prod?"]
-    R -- Yes --> S["terraform apply\n-var-file=environments/prod.tfvars"]
-    S --> T["✅ Production deployed"]
+    A["👨‍💻 Developer clones repo"] --> B["Configure AWS credentials\naws configure"]
+    B --> C["terraform init\nDownload providers & modules"]
+    C --> D["terraform plan\nPreview all resource changes"]
+    D --> E{Plan looks correct?}
+    E -- No --> F["Fix configuration\nRe-run plan"]
+    E -- Yes --> G["terraform apply\nProvision infrastructure"]
+    G --> H{Apply success?}
+    H -- No --> I["Check AWS Console\nReview error output"]
+    H -- Yes --> J["✅ Infrastructure Ready\nALB DNS available as output"]
+    J --> K["Spring Boot app deployed\nvia ASG + Launch Template"]
+    K --> L["✅ PetClinic App Live"]
 ```
 
 ---
 
 ## 🏛️ Architecture Overview
 
-The solution deploys a **multi-tier, highly available** Spring Boot application across multiple Availability Zones, fronted by an Application Load Balancer, backed by an RDS PostgreSQL cluster, with all traffic flowing through a strictly controlled VPC network topology.
+The solution provisions a **three-tier, multi-AZ** infrastructure for a Spring Boot (PetClinic) application. Traffic enters through a public-facing Application Load Balancer, reaches EC2 instances managed by an Auto Scaling Group in private subnets, which connect to a MySQL RDS instance in isolated secure subnets.
 
 ```mermaid
 graph TB
     subgraph Internet["🌐 Internet"]
         User["👤 End User"]
-        Dev["👨‍💻 Developer / CI-CD"]
     end
 
-    subgraph AWS["☁️ AWS Cloud — us-east-1"]
+    subgraph AWS["☁️ AWS Cloud"]
 
-        subgraph Route53["Route 53"]
-            DNS["DNS Record\napp.example.com"]
-        end
+        subgraph VPC["🔒 VPC"]
 
-        subgraph ACM["ACM"]
-            CERT["TLS Certificate\n*.example.com"]
-        end
-
-        subgraph VPC["🔒 VPC — 10.0.0.0/16"]
-
-            subgraph PublicSubnets["Public Subnets (AZ-a & AZ-b)"]
-                ALB["Application\nLoad Balancer\n:443 / :80"]
-                NAT_A["NAT Gateway\nAZ-a"]
-                NAT_B["NAT Gateway\nAZ-b"]
-                IGW["Internet\nGateway"]
+            subgraph PublicSubnets["Public Subnets — AZ1 & AZ2"]
+                ALB["Application Load Balancer\nHTTP :80"]
+                NAT1["NAT Gateway AZ1"]
+                NAT2["NAT Gateway AZ2"]
+                IGW["Internet Gateway"]
             end
 
-            subgraph PrivateSubnets["Private App Subnets (AZ-a & AZ-b)"]
-                EC2_A["EC2 / ASG\nSpring Boot\nAZ-a"]
-                EC2_B["EC2 / ASG\nSpring Boot\nAZ-b"]
+            subgraph PrivateSubnets["Private Subnets — AZ1 & AZ2"]
+                ASG["Auto Scaling Group\nEC2 t2.micro\nSpring Boot PetClinic"]
             end
 
-            subgraph DBSubnets["Private DB Subnets (AZ-a & AZ-b)"]
-                RDS_PRIMARY["RDS PostgreSQL\nPrimary\nAZ-a"]
-                RDS_REPLICA["RDS PostgreSQL\nRead Replica\nAZ-b"]
+            subgraph SecureSubnets["Secure Subnets — AZ1 & AZ2"]
+                RDS["RDS MySQL 8.0\ndb.t2.micro\npetclinic DB"]
+            end
+
+            subgraph SSMEndpoints["VPC Interface Endpoints"]
+                EP["ssm · ssmmessages · ec2messages"]
             end
 
             subgraph SGs["Security Groups"]
-                SG_ALB["sg-alb\n0.0.0.0/0 → 443"]
-                SG_APP["sg-app\nALB → 8080"]
-                SG_DB["sg-db\nApp → 5432"]
+                SG_ALB["sg-alb/ec2\n0.0.0.0/0 → :80, :443"]
+                SG_DB["sg-db\nalb-sg → :3306"]
+                SG_EP["sg-endpoint\n0.0.0.0/0 → :443"]
             end
 
         end
 
-        subgraph StateBackend["Terraform State Backend"]
-            S3["S3 Bucket\ntf-state"]
-            DDB["DynamoDB\nState Lock"]
-        end
-
-        subgraph Secrets["AWS Secrets Manager"]
-            SECRET["DB Credentials\nApp Secrets"]
-        end
-
         subgraph IAM["IAM"]
-            ROLE["EC2 Instance Role\n+ SSM Policy"]
+            ROLE["EC2 IAM Role\nAmazonSSMManagedInstanceCore"]
         end
 
     end
 
-    User --> DNS
-    DNS --> ALB
-    Dev -->|"terraform apply"| S3
-    S3 <-->|"state lock"| DDB
-    ALB --> EC2_A & EC2_B
-    EC2_A & EC2_B --> RDS_PRIMARY
-    RDS_PRIMARY --> RDS_REPLICA
-    NAT_A --> IGW
-    NAT_B --> IGW
-    EC2_A --> NAT_A
-    EC2_B --> NAT_B
-    EC2_A & EC2_B --> SECRET
+    User -->|"HTTP :80"| ALB
+    ALB --> ASG
+    ASG --> RDS
+    ASG --> NAT1 & NAT2
+    NAT1 & NAT2 --> IGW
+    IGW --> Internet
+    ASG --> EP
+    ROLE --> ASG
 ```
 
 ---
 
 ## 🧩 Infrastructure Components
 
-| Component | AWS Service | Purpose |
-|---|---|---|
-| **Compute** | EC2 + Auto Scaling Group | Spring Boot app servers with dynamic scaling |
-| **Load Balancing** | Application Load Balancer | HTTPS termination, path-based routing |
-| **Database** | RDS PostgreSQL (Multi-AZ) | Persistent data store with automated failover |
-| **Networking** | VPC, Subnets, Route Tables | Isolated, multi-tier network topology |
-| **DNS & TLS** | Route 53 + ACM | Custom domain with managed certificates |
-| **Secrets** | AWS Secrets Manager | Secure credential injection at runtime |
-| **Identity** | IAM Roles & Policies | Least-privilege access for EC2 instances |
-| **State** | S3 + DynamoDB | Remote state with distributed locking |
-| **Monitoring** | CloudWatch + Alarms | CPU, memory, and custom app metrics |
+| Component | AWS Resource | Module | Details |
+|---|---|---|---|
+| **Network** | VPC, Subnets, IGW, Route Tables | `vpc` | 3 tiers: public / private / secure across 2 AZs |
+| **NAT** | NAT Gateway, Elastic IP | `natgateway` | One NAT Gateway per AZ with dedicated route tables |
+| **Security** | Security Groups | `security_group` | HTTP :80 and HTTPS :443 from internet |
+| **Load Balancer** | ALB, Target Group, Listener | `alb` | HTTP :80 → forward to EC2 target group |
+| **Compute & IAM** | IAM Role, VPC Endpoints, Instance Profile | `ec2` | SSM-managed access; no SSH; 3 Interface Endpoints |
+| **App Scaling** | Launch Template, ASG | `asg` | Latest Amazon Linux 2 AMI; userdata via templatefile |
+| **Database** | RDS MySQL, DB Subnet Group, DB SG | `rds` | MySQL 8.0.31, single-AZ, isolated in secure subnets |
 
 ---
 
@@ -152,45 +123,44 @@ graph TB
 ```
 Terraform_Infra_SpringApp/
 │
-├── main.tf                   # Root module — wires all child modules together
-├── variables.tf              # Root-level input variable declarations
-├── outputs.tf                # Exposed outputs (ALB DNS, RDS endpoint, etc.)
-├── terraform.tfvars          # Default variable values
-├── versions.tf               # Provider + Terraform version pinning
-├── backend.tf                # Remote S3 backend configuration
-│
-├── environments/
-│   ├── dev.tfvars            # Dev environment overrides
-│   ├── staging.tfvars        # Staging environment overrides
-│   └── prod.tfvars           # Production environment overrides
+├── main/
+│   ├── main.tf           # Root module — orchestrates all child modules
+│   ├── variables.tf      # Input variable declarations
+│   ├── outputs.tf        # Exposed outputs (ALB DNS, etc.)
+│   └── userdata.sh       # EC2 bootstrap script (rendered via templatefile)
 │
 └── modules/
-    ├── networking/           # VPC, Subnets, IGW, NAT, Route Tables, SGs
+    ├── vpc/              # VPC, 6 Subnets (public/private/secure), IGW, Route Tables
     │   ├── main.tf
     │   ├── variables.tf
     │   └── outputs.tf
     │
-    ├── compute/              # EC2 Launch Template + Auto Scaling Group
+    ├── natgateway/       # Elastic IPs, NAT Gateways (per AZ), Private Route Tables
     │   ├── main.tf
     │   ├── variables.tf
     │   └── outputs.tf
     │
-    ├── load_balancer/        # ALB, Target Groups, Listeners, SSL
+    ├── security_group/   # Shared ALB/EC2 Security Group
     │   ├── main.tf
     │   ├── variables.tf
     │   └── outputs.tf
     │
-    ├── database/             # RDS PostgreSQL, Subnet Groups, Parameter Groups
+    ├── alb/              # ALB, Target Group, HTTP Listener
     │   ├── main.tf
     │   ├── variables.tf
     │   └── outputs.tf
     │
-    ├── iam/                  # IAM Roles, Instance Profiles, Policies
+    ├── ec2/              # VPC Interface Endpoints (SSM), IAM Role + Instance Profile
     │   ├── main.tf
     │   ├── variables.tf
     │   └── outputs.tf
     │
-    └── monitoring/           # CloudWatch Dashboards, Alarms, Log Groups
+    ├── asg/              # AMI Data Source, Launch Template, Auto Scaling Group
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    │
+    └── rds/              # DB Security Group, DB Subnet Group, RDS MySQL Instance
         ├── main.tf
         ├── variables.tf
         └── outputs.tf
@@ -202,299 +172,244 @@ Terraform_Infra_SpringApp/
 
 ### 1. Modular Design
 
-The infrastructure is composed of **independently versioned, reusable child modules**. The root `main.tf` acts purely as an orchestrator — it does not define any resources directly, only module calls.
+The root `main/main.tf` acts purely as an **orchestrator** — it contains zero resource definitions. Every piece of infrastructure lives in a dedicated child module with its own `variables.tf` and `outputs.tf`. The root module wires them together by passing outputs from one module as inputs to the next.
 
 ```hcl
-# main.tf — Root module wiring child modules together
+# main/main.tf
 
-module "networking" {
-  source = "./modules/networking"
-
-  vpc_cidr             = var.vpc_cidr
-  availability_zones   = var.availability_zones
-  public_subnet_cidrs  = var.public_subnet_cidrs
-  private_subnet_cidrs = var.private_subnet_cidrs
-  db_subnet_cidrs      = var.db_subnet_cidrs
-  environment          = var.environment
-  tags                 = local.common_tags
+module "vpc" {
+  source                  = "../modules/vpc"
+  region                  = var.region
+  project_name            = var.project_name
+  vpc_cidr                = var.vpc_cidr
+  public_subnet_az1_cidr  = var.public_subnet_az1_cidr
+  public_subnet_az2_cidr  = var.public_subnet_az2_cidr
+  private_subnet_az1_cidr = var.private_subnet_az1_cidr
+  private_subnet_az2_cidr = var.private_subnet_az2_cidr
+  secure_subnet_az1_cidr  = var.secure_subnet_az1_cidr
+  secure_subnet_az2_cidr  = var.secure_subnet_az2_cidr
 }
 
-module "compute" {
-  source = "./modules/compute"
-
-  ami_id             = data.aws_ami.amazon_linux.id
-  instance_type      = var.instance_type
-  min_size           = var.asg_min_size
-  max_size           = var.asg_max_size
-  desired_capacity   = var.asg_desired_capacity
-  private_subnet_ids = module.networking.private_subnet_ids
-  security_group_id  = module.networking.app_sg_id
-  iam_instance_profile = module.iam.instance_profile_name
-  target_group_arns  = module.load_balancer.target_group_arns
-  user_data          = templatefile("${path.module}/templates/user_data.sh.tpl", {
-    db_endpoint = module.database.db_endpoint
-    secret_arn  = module.database.secret_arn
-    app_env     = var.environment
-  })
-  tags = local.common_tags
-}
-
-module "database" {
-  source = "./modules/database"
-
-  engine_version    = var.db_engine_version
-  instance_class    = var.db_instance_class
-  db_name           = var.db_name
-  multi_az          = var.environment == "prod" ? true : false
-  subnet_ids        = module.networking.db_subnet_ids
-  security_group_id = module.networking.db_sg_id
-  tags              = local.common_tags
+module "asg" {
+  source                    = "../modules/asg"
+  project_name              = module.vpc.project_name
+  rds_db_endpoint           = module.rds.rds_db_endpoint
+  private_subnet_az1_id     = module.vpc.private_subnet_az1_id
+  private_subnet_az2_id     = module.vpc.private_subnet_az2_id
+  application_load_balancer = module.application_load_balancer.application_load_balancer
+  alb_target_group_arn      = module.application_load_balancer.alb_target_group_arn
+  alb_security_group_id     = module.security_group.alb_security_group_id
+  iam_ec2_instance_profile  = module.ec2.iam_ec2_instance_profile
 }
 ```
-
-**Why this matters:** Each module has a clean, versioned interface (inputs/outputs). Teams can work on modules independently, modules can be tested in isolation, and the same module is reused across dev/staging/prod with different `tfvars`.
 
 ---
 
-### 2. Dynamic Parameterization
+### 2. `locals` + `for_each` for Dynamic Resource Creation
 
-Rather than hardcoding values, the project uses **`locals`, `for_each`, `dynamic` blocks, conditional expressions, and `templatefile`** to make the configuration fully data-driven.
-
-#### Dynamic Subnet Creation with `for_each`
+Instead of writing a separate `aws_vpc_endpoint` resource block for each SSM endpoint, the `ec2` module uses a **`locals` map** combined with **`for_each`** to create all three VPC Interface Endpoints from a single resource block. Adding or removing an endpoint is a one-line change to the map.
 
 ```hcl
-# modules/networking/main.tf
-
-resource "aws_subnet" "public" {
-  for_each = {
-    for idx, cidr in var.public_subnet_cidrs :
-    var.availability_zones[idx] => {
-      cidr = cidr
-      az   = var.availability_zones[idx]
-    }
-  }
-
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = each.value.cidr
-  availability_zone       = each.value.az
-  map_public_ip_on_launch = true
-
-  tags = merge(var.tags, {
-    Name = "${var.environment}-public-${each.key}"
-    Tier = "public"
-  })
-}
-```
-
-#### Dynamic Security Group Rules
-
-```hcl
-resource "aws_security_group" "app" {
-  name   = "${var.environment}-app-sg"
-  vpc_id = aws_vpc.main.id
-
-  dynamic "ingress" {
-    for_each = var.app_ingress_rules
-    content {
-      from_port       = ingress.value.from_port
-      to_port         = ingress.value.to_port
-      protocol        = ingress.value.protocol
-      security_groups = ingress.value.source_sg_ids
-      description     = ingress.value.description
-    }
-  }
-
-  dynamic "egress" {
-    for_each = var.app_egress_rules
-    content {
-      from_port   = egress.value.from_port
-      to_port     = egress.value.to_port
-      protocol    = egress.value.protocol
-      cidr_blocks = egress.value.cidr_blocks
-    }
-  }
-}
-```
-
-#### Environment-Aware Locals
-
-```hcl
-# variables.tf / locals block
+# modules/ec2/main.tf
 
 locals {
-  common_tags = {
-    Project     = var.project_name
-    Environment = var.environment
-    ManagedBy   = "Terraform"
-    Owner       = var.team_owner
-  }
-
-  # Dynamically compute AZ count to match subnet lists
-  az_count = length(var.availability_zones)
-
-  # Environment-specific sizing
-  db_config = {
-    dev = {
-      instance_class    = "db.t3.micro"
-      allocated_storage = 20
-      multi_az          = false
-    }
-    staging = {
-      instance_class    = "db.t3.medium"
-      allocated_storage = 50
-      multi_az          = false
-    }
-    prod = {
-      instance_class    = "db.r6g.large"
-      allocated_storage = 200
-      multi_az          = true
+  endpoints = {
+    "endpoint-ssm" = {
+      name = "ssm"
+    },
+    "endpoint-ssmmessages" = {
+      name = "ssmmessages"
+    },
+    "endpoint-ec2-messages" = {
+      name = "ec2messages"
     }
   }
+}
 
-  effective_db_config = local.db_config[var.environment]
+resource "aws_vpc_endpoint" "endpoints" {
+  vpc_id             = var.vpc_id
+  for_each           = local.endpoints
+  vpc_endpoint_type  = "Interface"
+  service_name       = "com.amazonaws.${var.region}.${each.value.name}"
+  security_group_ids = [aws_security_group.vpc_endpoint_security_group.id]
 }
 ```
 
+This creates three uniquely keyed resources — removing one entry from the map only destroys that specific endpoint, leaving the others untouched.
+
 ---
 
-### 3. Advanced Networking
+### 3. Data Sources for Dynamic Parameterization
 
-A **three-tier VPC** is implemented from scratch — no defaults, no shared infrastructure. The design enforces strict traffic segmentation between public, application, and database layers.
+Two data sources make the configuration fully environment-agnostic — no hardcoded AZ names or AMI IDs anywhere in the codebase.
+
+**`aws_availability_zones`** — used in both the `vpc` and `rds` modules to automatically discover AZs in whichever region Terraform targets:
+
+```hcl
+# modules/vpc/main.tf
+
+data "aws_availability_zones" "available_zones" {}
+
+resource "aws_subnet" "public_subnet_az1" {
+  vpc_id            = aws_vpc.infra.id
+  cidr_block        = var.public_subnet_az1_cidr
+  availability_zone = data.aws_availability_zones.available_zones.names[0]
+  map_public_ip_on_launch = true
+  tags = {
+    Name = "public subnet az1"
+  }
+}
+```
+
+**`aws_ami` with `filter` blocks** — used in the `asg` module to always resolve the latest Amazon Linux 2 AMI at plan time:
+
+```hcl
+# modules/asg/main.tf
+
+data "aws_ami" "amazon_linux_2" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "owner-alias"
+    values = ["amazon"]
+  }
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm*"]
+  }
+}
+```
+
+No AMI ID ever needs to be manually updated — Terraform resolves the freshest one on every `plan`.
+
+---
+
+### 4. `templatefile()` for Dynamic User Data
+
+The EC2 Launch Template injects the live RDS endpoint into the EC2 bootstrap script at apply time using `templatefile()`, combined with `base64encode()` as required by the Launch Template API. No database URLs are hardcoded anywhere.
+
+```hcl
+# modules/asg/main.tf
+
+resource "aws_launch_template" "ec2_asg" {
+  name          = "my-launch-template"
+  image_id      = data.aws_ami.amazon_linux_2.id
+  instance_type = "t2.micro"
+
+  iam_instance_profile {
+    name = var.iam_ec2_instance_profile.name
+  }
+
+  user_data = base64encode(
+    templatefile("userdata.sh", { mysql_url = var.rds_db_endpoint })
+  )
+
+  vpc_security_group_ids = [var.alb_security_group_id]
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+The `userdata.sh` script receives `mysql_url` as a template variable and uses it to configure the Spring Boot application's database connection — the RDS endpoint flows automatically from the `rds` module output into the running EC2 instance at boot.
+
+---
+
+### 5. Advanced Networking — Three-Tier VPC
+
+The VPC is split into **three distinct subnet tiers**, each with its own route table and security group controls, enforcing strict traffic isolation between the public, application, and database layers.
 
 ```mermaid
 graph LR
-    subgraph VPC["VPC 10.0.0.0/16"]
+    subgraph VPC["VPC"]
 
-        subgraph AZ_A["Availability Zone A"]
-            PUB_A["Public Subnet\n10.0.1.0/24\n(ALB, NAT GW)"]
-            PRIV_A["Private App Subnet\n10.0.11.0/24\n(EC2 / ASG)"]
-            DB_A["Private DB Subnet\n10.0.21.0/24\n(RDS Primary)"]
+        subgraph AZ1["Availability Zone 1"]
+            PUB1["Public Subnet AZ1\nALB · NAT GW · IGW"]
+            PRI1["Private Subnet AZ1\nEC2 / ASG"]
+            SEC1["Secure Subnet AZ1\nRDS MySQL"]
         end
 
-        subgraph AZ_B["Availability Zone B"]
-            PUB_B["Public Subnet\n10.0.2.0/24\n(ALB, NAT GW)"]
-            PRIV_B["Private App Subnet\n10.0.12.0/24\n(EC2 / ASG)"]
-            DB_B["Private DB Subnet\n10.0.22.0/24\n(RDS Replica)"]
+        subgraph AZ2["Availability Zone 2"]
+            PUB2["Public Subnet AZ2\nALB · NAT GW · IGW"]
+            PRI2["Private Subnet AZ2\nEC2 / ASG"]
+            SEC2["Secure Subnet AZ2\nRDS Subnet Group"]
         end
 
-        subgraph Gateways["Gateways & Routing"]
-            IGW["Internet Gateway"]
-            NAT_A2["NAT GW (AZ-A)"]
-            NAT_B2["NAT GW (AZ-B)"]
-        end
-
-        subgraph RTables["Route Tables"]
+        subgraph Routing["Route Tables"]
             RT_PUB["Public RT\n0.0.0.0/0 → IGW"]
-            RT_PRIV_A["Private RT A\n0.0.0.0/0 → NAT-A"]
-            RT_PRIV_B["Private RT B\n0.0.0.0/0 → NAT-B"]
-            RT_DB["DB RT\nNo internet route"]
+            RT_PRI1["Private RT AZ1\n0.0.0.0/0 → NAT-AZ1"]
+            RT_PRI2["Private RT AZ2\n0.0.0.0/0 → NAT-AZ2"]
         end
 
     end
 
-    IGW --> RT_PUB
-    RT_PUB --> PUB_A & PUB_B
-    NAT_A2 --> RT_PRIV_A
-    NAT_B2 --> RT_PRIV_B
-    RT_PRIV_A --> PRIV_A
-    RT_PRIV_B --> PRIV_B
-    RT_DB --> DB_A & DB_B
+    RT_PUB --> PUB1 & PUB2
+    RT_PRI1 --> PRI1
+    RT_PRI2 --> PRI2
 ```
 
-#### Key networking decisions:
+| Tier | Subnets | Route | Accessible From |
+|---|---|---|---|
+| **Public** | `public_subnet_az1/2` | `0.0.0.0/0 → IGW` | Internet (ALB, NAT GW) |
+| **Private** | `private_subnet_az1/2` | `0.0.0.0/0 → NAT GW` | ALB only (via SG) |
+| **Secure** | `secure_subnet_az1/2` | No internet route | App layer only (port 3306 via DB SG) |
 
-| Decision | Rationale |
-|---|---|
-| **Separate NAT Gateway per AZ** | Eliminates cross-AZ NAT traffic; avoids single NAT as SPOF |
-| **No public IPs on app/DB instances** | Zero direct internet exposure for compute and data tiers |
-| **Dedicated DB subnets with no outbound route** | DB instances cannot initiate outbound connections |
-| **Security groups as the only inbound rule source** | No CIDR-based rules between layers; SG chaining provides tight blast radius |
-| **VPC Endpoint for S3/SSM** | EC2 instances access AWS services without traversing the internet |
+The secure subnets have no route table entry to the internet — the RDS instance cannot initiate or receive internet connections at the network layer.
+
+---
+
+### 6. Per-AZ NAT Gateway Design
+
+Two separate NAT Gateways are provisioned — one per AZ — each with its own Elastic IP and a dedicated private route table:
 
 ```hcl
-# modules/networking/main.tf — NAT Gateway per AZ
+# modules/natgateway/main.tf
 
-resource "aws_eip" "nat" {
-  for_each = toset(var.availability_zones)
-  domain   = "vpc"
-  tags     = merge(var.tags, { Name = "${var.environment}-eip-${each.key}" })
+resource "aws_nat_gateway" "nat_gateway_az1" {
+  allocation_id = aws_eip.eip_for_nat_gateway_az1.id
+  subnet_id     = var.public_subnet_az1_id
+  depends_on    = [var.internet_gateway]
 }
 
-resource "aws_nat_gateway" "main" {
-  for_each      = aws_subnet.public
-  allocation_id = aws_eip.nat[each.key].id
-  subnet_id     = each.value.id
-  tags          = merge(var.tags, { Name = "${var.environment}-nat-${each.key}" })
-  depends_on    = [aws_internet_gateway.main]
+resource "aws_nat_gateway" "nat_gateway_az2" {
+  allocation_id = aws_eip.eip_for_nat_gateway_az2.id
+  subnet_id     = var.public_subnet_az2_id
+  depends_on    = [var.internet_gateway]
 }
 
-resource "aws_route_table" "private" {
-  for_each = toset(var.availability_zones)
-  vpc_id   = aws_vpc.main.id
-
+resource "aws_route_table" "private_route_table_az1" {
+  vpc_id = var.vpc_id
   route {
     cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.main[each.key].id
+    nat_gateway_id = aws_nat_gateway.nat_gateway_az1.id
   }
-
-  tags = merge(var.tags, { Name = "${var.environment}-rt-private-${each.key}" })
 }
-```
 
----
-
-### 4. Remote State Management
-
-State is stored in **S3 with server-side encryption and versioning**, and **DynamoDB is used for state locking** to prevent concurrent `terraform apply` runs — critical in team environments and CI/CD pipelines.
-
-```hcl
-# backend.tf
-
-terraform {
-  backend "s3" {
-    bucket         = "mycompany-terraform-state"
-    key            = "springapp/${var.environment}/terraform.tfstate"
-    region         = "us-east-1"
-    encrypt        = true
-    kms_key_id     = "arn:aws:kms:us-east-1:ACCOUNT_ID:key/KEY_ID"
-    dynamodb_table = "terraform-state-lock"
+resource "aws_route_table" "private_route_table_az2" {
+  vpc_id = var.vpc_id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat_gateway_az2.id
   }
 }
 ```
 
-```mermaid
-sequenceDiagram
-    participant Dev as Developer / CI
-    participant TF as Terraform CLI
-    participant DDB as DynamoDB (Lock)
-    participant S3 as S3 (State)
-    participant AWS as AWS APIs
-
-    Dev->>TF: terraform apply
-    TF->>DDB: Acquire state lock (LockID)
-    DDB-->>TF: Lock granted ✅
-    TF->>S3: Read current state
-    S3-->>TF: terraform.tfstate
-    TF->>AWS: Create / Update resources
-    AWS-->>TF: Resource ARNs / IDs
-    TF->>S3: Write updated state
-    TF->>DDB: Release lock
-    DDB-->>TF: Lock released ✅
-    TF-->>Dev: Apply complete
-```
+A shared single NAT Gateway would be a **single point of failure** — if its AZ went down, all private subnets would lose outbound internet. The per-AZ design also eliminates cross-AZ data transfer charges.
 
 ---
 
-### 5. Security & IAM
+### 7. IAM + SSM — No SSH Required
 
-Following the **principle of least privilege**, EC2 instances receive an IAM role with only the permissions needed at runtime. Database credentials are **never stored in Terraform state** — they are generated and stored in Secrets Manager.
+EC2 instances have no key pair. Access is managed entirely through **IAM roles and AWS Systems Manager**. The `ec2` module creates the role, attaches `AmazonSSMManagedInstanceCore`, and provisions three VPC Interface Endpoints so SSM traffic never leaves the VPC. The IAM trust policy is authored inline using `jsonencode()`:
 
 ```hcl
-# modules/iam/main.tf
+# modules/ec2/main.tf
 
 resource "aws_iam_role" "ec2_role" {
-  name = "${var.environment}-springapp-ec2-role"
-
+  name = "EC2_SSM_Role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -505,75 +420,59 @@ resource "aws_iam_role" "ec2_role" {
   })
 }
 
-resource "aws_iam_role_policy" "secrets_access" {
-  name = "secrets-manager-read"
-  role = aws_iam_role.ec2_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
-        Resource = ["arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:${var.environment}/springapp/*"]
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
-        Resource = ["arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.environment}/springapp/*"]
-      }
-    ]
-  })
+resource "aws_iam_role_policy_attachment" "ec2_role_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  role       = aws_iam_role.ec2_role.name
 }
 
-# Attach AWS managed policies (SSM Session Manager — no SSH required)
-resource "aws_iam_role_policy_attachment" "ssm" {
-  role       = aws_iam_role.ec2_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+resource "aws_iam_instance_profile" "ec2_instance_profile" {
+  name = "EC2_SSM_Instance_Profile"
+  role = aws_iam_role.ec2_role.name
 }
 ```
 
 ---
 
-## 🌐 Networking Deep Dive
+### 8. Cross-Module Output Passing
 
-### Security Group Chaining
+No resource ID is ever hardcoded between modules. Every value — `vpc_id`, `subnet_ids`, `alb_security_group_id`, `rds_db_endpoint`, `iam_ec2_instance_profile` — flows through declared outputs and inputs, maintaining clean module boundaries.
 
 ```mermaid
 graph LR
-    Internet["🌐 Internet\n0.0.0.0/0"] -->|"HTTPS :443\nHTTP :80"| SG_ALB["sg-alb\nALB Security Group"]
-    SG_ALB -->|"TCP :8080\n(src: sg-alb)"| SG_APP["sg-app\nApp Security Group"]
-    SG_APP -->|"TCP :5432\n(src: sg-app)"| SG_DB["sg-db\nDB Security Group"]
-
-    SG_APP -->|"HTTPS :443\noutbound only"| NAT["NAT GW → Internet\n(S3, ECR, Secrets Mgr)"]
+    VPC["module.vpc"] -->|"vpc_id · subnet_ids · project_name"| SG["module.security_group"]
+    VPC -->|"vpc_id · subnet_ids"| NAT["module.natgateway"]
+    VPC -->|"vpc_id · public_subnet_ids"| ALB["module.alb"]
+    VPC -->|"vpc_id · secure_subnet_ids"| RDS["module.rds"]
+    VPC -->|"vpc_id"| EC2["module.ec2"]
+    SG -->|"alb_security_group_id"| ALB
+    SG -->|"alb_security_group_id"| RDS
+    SG -->|"alb_security_group_id"| ASG["module.asg"]
+    ALB -->|"alb_arn · target_group_arn"| ASG
+    RDS -->|"rds_db_endpoint"| ASG
+    EC2 -->|"iam_ec2_instance_profile"| ASG
 ```
 
-No layer can be accessed except through the layer directly above it. The database security group **exclusively** allows inbound traffic from the application security group — no IP ranges, no broad access.
+---
 
-### VPC Endpoint Strategy
+### 9. `lifecycle` — `create_before_destroy`
+
+Both the ALB Target Group and the EC2 Launch Template use `create_before_destroy = true`, so Terraform creates the replacement resource first before destroying the old one — preventing traffic gaps during updates:
 
 ```hcl
-# modules/networking/main.tf — Gateway and Interface Endpoints
-
-resource "aws_vpc_endpoint" "s3" {
-  vpc_id            = aws_vpc.main.id
-  service_name      = "com.amazonaws.${var.region}.s3"
-  vpc_endpoint_type = "Gateway"
-  route_table_ids   = values(aws_route_table.private)[*].id
-
-  tags = merge(var.tags, { Name = "${var.environment}-s3-endpoint" })
+# modules/alb/main.tf
+resource "aws_lb_target_group" "alb_target_group" {
+  ...
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-resource "aws_vpc_endpoint" "ssm" {
-  for_each            = toset(["ssm", "ssmmessages", "ec2messages", "secretsmanager"])
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${var.region}.${each.key}"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = values(aws_subnet.private)[*].id
-  security_group_ids  = [aws_security_group.vpc_endpoints.id]
-  private_dns_enabled = true
-
-  tags = merge(var.tags, { Name = "${var.environment}-${each.key}-endpoint" })
+# modules/asg/main.tf
+resource "aws_launch_template" "ec2_asg" {
+  ...
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 ```
 
@@ -583,69 +482,28 @@ resource "aws_vpc_endpoint" "ssm" {
 
 ```mermaid
 graph TD
-    ROOT["🌱 Root Module\nmain.tf"]
+    ROOT["🌱 Root Module\nmain/main.tf"]
 
-    ROOT --> NET["📡 module.networking\nVPC · Subnets · SGs\nRoute Tables · NAT GW"]
-    ROOT --> IAM["🔐 module.iam\nEC2 Role\nInstance Profile"]
-    ROOT --> DB["🗄️ module.database\nRDS · Subnet Group\nParameter Group"]
-    ROOT --> ALB["⚖️ module.load_balancer\nALB · Target Group\nListeners · ACM"]
-    ROOT --> COMPUTE["💻 module.compute\nLaunch Template\nAuto Scaling Group"]
-    ROOT --> MON["📊 module.monitoring\nCloudWatch\nAlarms · Log Groups"]
+    ROOT --> VPC["📡 module.vpc\nVPC · 6 Subnets · IGW\nPublic Route Table"]
+    ROOT --> NAT["🔀 module.natgateway\n2× NAT GW · 2× EIP\n2× Private Route Tables"]
+    ROOT --> SG["🔒 module.security_group\nALB + EC2 Security Group"]
+    ROOT --> ALB["⚖️ module.alb\nALB · Target Group\nHTTP Listener :80"]
+    ROOT --> EC2["🔑 module.ec2\nIAM Role · Instance Profile\n3× VPC Interface Endpoints"]
+    ROOT --> RDS["🗄️ module.rds\nRDS MySQL · DB SG\nDB Subnet Group"]
+    ROOT --> ASG["💻 module.asg\nLaunch Template · ASG\nAmazon Linux 2 AMI"]
 
-    NET -->|"vpc_id\nsubnet_ids\nsg_ids"| DB
-    NET -->|"vpc_id\nsubnet_ids\nsg_ids"| ALB
-    NET -->|"subnet_ids\nsg_id"| COMPUTE
-    IAM -->|"instance_profile_name"| COMPUTE
-    ALB -->|"target_group_arns"| COMPUTE
-    DB -->|"db_endpoint\nsecret_arn"| COMPUTE
-    COMPUTE -->|"asg_arn"| MON
-    DB -->|"db_instance_id"| MON
-    ALB -->|"alb_arn"| MON
-```
-
----
-
-## 📊 Variable Hierarchy
-
-```mermaid
-graph TB
-    A["🌍 Environment Variables\nTF_VAR_* — CI/CD secrets\neg. TF_VAR_db_password"] --> MERGE
-
-    B["📄 terraform.tfvars\nProject-wide defaults\nvpc_cidr, project_name, region"] --> MERGE
-
-    C["📄 environments/prod.tfvars\nEnvironment overrides\ninstance_type, asg_max_size, multi_az"] --> MERGE
-
-    D["🔧 -var flags\nRuntime overrides\neg. -var='instance_type=m5.xlarge'"] --> MERGE
-
-    MERGE["🔀 Terraform Variable\nMerge & Validation"] --> LOCALS
-
-    LOCALS["📐 locals {}\nDerived values\ncommon_tags, db_config\naz_count, naming conventions"] --> RESOURCES
-
-    RESOURCES["📦 Resources &\nModule Calls"]
-```
-
-**Variable validation example:**
-
-```hcl
-variable "environment" {
-  description = "Deployment environment (controls resource sizing and HA settings)"
-  type        = string
-
-  validation {
-    condition     = contains(["dev", "staging", "prod"], var.environment)
-    error_message = "environment must be one of: dev, staging, prod."
-  }
-}
-
-variable "availability_zones" {
-  description = "List of AZs to deploy into — must match subnet CIDR list lengths"
-  type        = list(string)
-
-  validation {
-    condition     = length(var.availability_zones) >= 2
-    error_message = "At least 2 Availability Zones required for high availability."
-  }
-}
+    VPC -->|"vpc_id · subnet_ids"| NAT
+    VPC -->|"vpc_id"| SG
+    VPC -->|"vpc_id · public_subnet_ids"| ALB
+    VPC -->|"vpc_id"| EC2
+    VPC -->|"vpc_id · secure_subnet_ids"| RDS
+    VPC -->|"private_subnet_ids · project_name"| ASG
+    SG -->|"alb_security_group_id"| ALB
+    SG -->|"alb_security_group_id"| RDS
+    SG -->|"alb_security_group_id"| ASG
+    ALB -->|"alb_arn · target_group_arn"| ASG
+    RDS -->|"rds_db_endpoint"| ASG
+    EC2 -->|"iam_ec2_instance_profile"| ASG
 ```
 
 ---
@@ -654,156 +512,71 @@ variable "availability_zones" {
 
 ### Prerequisites
 
-- Terraform `>= 1.5.0`
-- AWS CLI configured with appropriate credentials
-- S3 bucket and DynamoDB table created for remote state (one-time bootstrap)
+- Terraform `>= 1.0`
+- AWS CLI configured (`aws configure`)
+- IAM permissions for EC2, VPC, RDS, IAM, ALB
 
-### Bootstrap Remote State (one-time)
-
-```bash
-# Create S3 bucket for state
-aws s3api create-bucket \
-  --bucket mycompany-terraform-state \
-  --region us-east-1
-
-aws s3api put-bucket-versioning \
-  --bucket mycompany-terraform-state \
-  --versioning-configuration Status=Enabled
-
-aws s3api put-bucket-encryption \
-  --bucket mycompany-terraform-state \
-  --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}'
-
-# Create DynamoDB table for locking
-aws dynamodb create-table \
-  --table-name terraform-state-lock \
-  --attribute-definitions AttributeName=LockID,AttributeType=S \
-  --key-schema AttributeName=LockID,KeyType=HASH \
-  --billing-mode PAY_PER_REQUEST
-```
-
-### Deploy to an Environment
+### Steps
 
 ```bash
-# 1. Initialise — downloads providers and configures backend
-terraform init \
-  -backend-config="key=springapp/prod/terraform.tfstate"
+# 1. Clone the repository
+git clone https://github.com/mavikcodes/Terraform_Infra_SpringApp.git
+cd Terraform_Infra_SpringApp/main
 
-# 2. Validate configuration
-terraform validate
+# 2. Initialise — downloads the AWS provider
+terraform init
 
-# 3. Format check
-terraform fmt -check -recursive
+# 3. Preview what will be created
+terraform plan
 
-# 4. Plan with environment-specific variables
-terraform plan \
-  -var-file="environments/prod.tfvars" \
-  -out=prod.tfplan
+# 4. Apply — provisions all infrastructure (~5-10 mins)
+terraform apply
 
-# 5. Review the plan output, then apply
-terraform apply prod.tfplan
-
-# 6. Retrieve key outputs
-terraform output alb_dns_name
-terraform output rds_endpoint
+# 5. Retrieve the ALB DNS to access the app
+terraform output
 ```
 
 ### Tear Down
 
 ```bash
-terraform destroy -var-file="environments/dev.tfvars"
+terraform destroy
 ```
-
----
-
-## 🌍 Environment Strategy
-
-| Parameter | `dev` | `staging` | `prod` |
-|---|---|---|---|
-| EC2 Instance Type | `t3.small` | `t3.medium` | `m5.large` |
-| ASG Min / Max | 1 / 2 | 1 / 4 | 2 / 10 |
-| RDS Instance | `db.t3.micro` | `db.t3.medium` | `db.r6g.large` |
-| RDS Multi-AZ | ❌ | ❌ | ✅ |
-| NAT Gateways | 1 (shared) | 2 (per-AZ) | 2 (per-AZ) |
-| VPC Endpoints | ❌ | ✅ | ✅ |
-| Deletion Protection | ❌ | ❌ | ✅ |
-| CloudWatch Alarms | ❌ | ✅ | ✅ |
-| Backup Retention | 1 day | 7 days | 30 days |
 
 ---
 
 ## 🏆 Interviewer Highlights
 
-> These are the specific engineering decisions in this codebase that demonstrate senior-level Terraform and DevOps maturity.
+> Specific engineering decisions in this codebase that demonstrate Terraform and DevOps maturity.
 
-### ✅ Reusable Module Design
-All infrastructure is composed of child modules with clean input/output contracts. The root module is purely declarative — it wires modules together but defines no resources directly. This mirrors how production platform teams manage shared infrastructure.
+### ✅ Clean Modular Architecture
+Seven focused child modules, each with a single responsibility. The root module holds zero `resource` blocks — only `module` calls. This mirrors how platform engineering teams structure shared infrastructure at scale.
 
-### ✅ `for_each` over `count`
-Resources that require stable identities (subnets, NAT gateways, route tables) use `for_each` with meaningful keys (AZ names) rather than positional `count`. This means adding or removing an AZ doesn't cause unintended resource replacements.
+### ✅ `locals` + `for_each` — DRY Resource Creation
+All three SSM VPC Interface Endpoints are created from a single `aws_vpc_endpoint` block using a `locals` map and `for_each`. Adding a new endpoint is a one-line map entry — no copy-paste, no duplicate resource blocks.
 
-### ✅ Dynamic Blocks for Runtime-Configurable Security Rules
-Security group rules are driven entirely by variable input — no hardcoded ports or CIDRs in resource definitions. The same module works for both the ALB and the application tier with different rule sets passed as variables.
+### ✅ Dynamic Data Sources — No Hardcoded AZ Names or AMI IDs
+`aws_availability_zones` makes the config portable across any AWS region. `aws_ami` with `filter` blocks always resolves the latest Amazon Linux 2 AMI at plan time — no manual updates ever needed.
 
-### ✅ Three-Tier Network Segmentation
-The VPC architecture enforces strict separation: public (ALB/NAT), private application, and private database subnets — each with their own route table and security group chain. The database layer has **no outbound internet route**, preventing data exfiltration at the network layer.
+### ✅ `templatefile()` — Runtime Config Injection
+The RDS endpoint is injected into the EC2 boot script automatically at `terraform apply` time. No connection strings are hardcoded anywhere — the value flows from the RDS module output through `templatefile()` into the running instance.
 
-### ✅ HA-First NAT Gateway Design
-Separate NAT Gateways per Availability Zone eliminate both the single-point-of-failure and cross-AZ data transfer costs associated with a shared NAT. Each private route table routes only to its own AZ's NAT.
+### ✅ Per-AZ NAT Gateway — High Availability Design
+Separate NAT Gateways in each AZ with dedicated private route tables eliminate the cross-AZ single point of failure and cross-AZ data transfer costs.
 
-### ✅ Zero Secrets in State
-Database passwords are never defined in Terraform. RDS uses `manage_master_user_password = true` to delegate credential management to Secrets Manager. EC2 instances retrieve the secret at boot via IAM role, not environment variables.
+### ✅ IAM + SSM — Zero SSH Attack Surface
+No keypairs, no bastion hosts. EC2 access is exclusively via AWS Systems Manager Session Manager, backed by a minimal IAM instance profile. Three VPC Interface Endpoints keep SSM traffic inside the VPC.
 
-### ✅ Remote State with Distributed Locking
-S3 backend with KMS encryption and DynamoDB locking is a production-essential pattern. It enables team collaboration without race conditions and maintains an auditable, versioned history of every infrastructure state.
+### ✅ `jsonencode()` for Inline IAM Policies
+IAM trust policies are authored directly in HCL using `jsonencode()` — no separate `.json` files, fully version-controlled and diff-friendly alongside the infrastructure code.
 
-### ✅ Variable Validation
-Input variables include `validation` blocks that enforce invariants (e.g., environment name must be in an allowed set, AZ count must be ≥ 2). This catches misconfiguration at plan time, before any AWS API calls are made.
+### ✅ `lifecycle { create_before_destroy }` — Zero-Downtime Updates
+The ALB Target Group and Launch Template both use `create_before_destroy = true`, ensuring Terraform never tears down an existing resource before its replacement is ready.
 
-### ✅ `templatefile()` for User Data
-EC2 bootstrap scripts are external `.tpl` files rendered with `templatefile()`, injecting Terraform-managed values (DB endpoint, secret ARN, environment name) at apply time. This keeps HCL clean and scripts testable independently.
+### ✅ Explicit `depends_on` for Correct Provisioning Order
+NAT Gateways declare `depends_on = [var.internet_gateway]` and the ASG declares `depends_on = [var.application_load_balancer]` — making implicit infrastructure ordering explicit and preventing race conditions during apply.
 
-### ✅ Environment-Aware Sizing via `locals`
-A single `locals` block encodes all environment-specific resource sizing as a map. Selecting the correct configuration is a single map lookup (`local.db_config[var.environment]`), rather than scattered conditional expressions throughout the codebase.
-
----
-
-## 📦 Provider & Version Pinning
-
-```hcl
-# versions.tf
-
-terraform {
-  required_version = ">= 1.5.0, < 2.0.0"
-
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.5"
-    }
-  }
-}
-
-provider "aws" {
-  region = var.region
-
-  default_tags {
-    tags = local.common_tags
-  }
-}
-```
-
-> Provider version pinning using `~>` (pessimistic constraint) ensures minor version upgrades are automatically adopted while major breaking changes are blocked until explicitly reviewed.
-
----
-
-## 📝 License
-
-MIT — see [LICENSE](LICENSE) for details.
+### ✅ Clean Cross-Module Output Wiring
+No resource ID is ever hardcoded across module boundaries. Every value flows through declared `outputs.tf` → `variables.tf` contracts, keeping modules independently testable and reusable.
 
 ---
 
