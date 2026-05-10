@@ -6,6 +6,7 @@
 
 ## 📋 Table of Contents
 
+- [How to Deploy](#-how-to-deploy)
 - [Deployment Workflow](#-deployment-workflow)
 - [Architecture Overview](#-architecture-overview)
 - [Infrastructure Components](#-infrastructure-components)
@@ -21,11 +22,44 @@
   - [Cross-Module Output Passing](#8-cross-module-output-passing)
   - [lifecycle — create_before_destroy](#9-lifecycle--create_before_destroy)
 - [Module Dependency Graph](#-module-dependency-graph)
-- [How to Deploy](#-how-to-deploy)
 - [Interviewer Highlights](#-interviewer-highlights)
 
 ---
+## ⚙️ How to Deploy
 
+### Prerequisites
+
+- Terraform `>= 1.0`
+- AWS CLI configured (`aws configure`)
+- IAM permissions for EC2, VPC, RDS, IAM, ALB
+
+### Steps
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/mavikcodes/Terraform_Infra_SpringApp.git
+cd Terraform_Infra_SpringApp/main
+
+# 2. Initialise — downloads the AWS provider
+terraform init
+
+# 3. Preview what will be created
+terraform plan
+
+# 4. Apply — provisions all infrastructure (~5-10 mins)
+terraform apply
+
+# 5. Retrieve the ALB DNS to access the app
+terraform output
+```
+
+### Tear Down
+
+```bash
+terraform destroy
+```
+
+---
 ## 🚀 Deployment Workflow
 
 ```mermaid
@@ -508,51 +542,14 @@ graph TD
 
 ---
 
-## ⚙️ How to Deploy
 
-### Prerequisites
 
-- Terraform `>= 1.0`
-- AWS CLI configured (`aws configure`)
-- IAM permissions for EC2, VPC, RDS, IAM, ALB
-
-### Steps
-
-```bash
-# 1. Clone the repository
-git clone https://github.com/mavikcodes/Terraform_Infra_SpringApp.git
-cd Terraform_Infra_SpringApp/main
-
-# 2. Initialise — downloads the AWS provider
-terraform init
-
-# 3. Preview what will be created
-terraform plan
-
-# 4. Apply — provisions all infrastructure (~5-10 mins)
-terraform apply
-
-# 5. Retrieve the ALB DNS to access the app
-terraform output
-```
-
-### Tear Down
-
-```bash
-terraform destroy
-```
-
----
-
-## 🏆 Interviewer Highlights
+## 🏆 Techniques Used
 
 > Specific engineering decisions in this codebase that demonstrate Terraform and DevOps maturity.
 
 ### ✅ Clean Modular Architecture
 Seven focused child modules, each with a single responsibility. The root module holds zero `resource` blocks — only `module` calls. This mirrors how platform engineering teams structure shared infrastructure at scale.
-
-### ✅ `locals` + `for_each` — DRY Resource Creation
-All three SSM VPC Interface Endpoints are created from a single `aws_vpc_endpoint` block using a `locals` map and `for_each`. Adding a new endpoint is a one-line map entry — no copy-paste, no duplicate resource blocks.
 
 ### ✅ Dynamic Data Sources — No Hardcoded AZ Names or AMI IDs
 `aws_availability_zones` makes the config portable across any AWS region. `aws_ami` with `filter` blocks always resolves the latest Amazon Linux 2 AMI at plan time — no manual updates ever needed.
@@ -581,5 +578,5 @@ No resource ID is ever hardcoded across module boundaries. Every value flows thr
 ---
 
 <div align="center">
-  <sub>Built with ❤️ using Terraform · AWS · Infrastructure as Code best practices</sub>
+  <sub>Built using Terraform · AWS · Infrastructure as Code best practices</sub>
 </div>
